@@ -17,6 +17,8 @@ from .area_weights import UniformWeights
 from .boolean_op import BooleanAndMask
 from .boolean_op import BooleanNot
 from .boolean_op import BooleanOrMask
+from .mesh_levels import MeshLevel
+from .mesh_levels import MeshLevelMask
 from .masks import CutOutMask
 from .masks import GridsMask
 from .masks import LimitedAreaMask
@@ -39,4 +41,6 @@ __all__ = [
     "CosineLatWeightedAttribute",
     "IsolatitudeAreaWeights",
     "AnemoiDatasetVariableWeights",
+    "MeshLevel",
+    "MeshLevelMask",
 ]

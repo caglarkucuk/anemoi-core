@@ -145,6 +145,27 @@ class StretchedIcosahdralNodeSchema(BaseModel):
     "Maximum distance to the reference nodes to consider a node as valid, in kilometers. Defaults to 100 km."
 
 
+class AdaptiveIcosahedralNodeSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.AdaptiveTriNodes"] = Field(..., alias="_target_")
+    "Class implementation for nodes based on iterative refinements of an icosahedron with a spatially varying resolution."
+    base_resolution: PositiveInt
+    "Coarsest refinement level, applied wherever nothing finer is requested."
+    max_resolution: PositiveInt
+    "Finest refinement level the target level field may request."
+    level_field: Optional[dict] = None
+    "Source of additional refinement, layered on top of the resolution floors. Defaults to none."
+    aoi_resolution: Optional[PositiveInt] = None
+    "Resolution floor inside the area of interest. Defaults to `max_resolution`."
+    reference_node_name: str
+    "Name of the reference nodes in the graph to consider for the Area Mask."
+    mask_attr_name: Optional[str] = None
+    "Name of a node to attribute to mask the reference nodes, if desired. Defaults to consider all reference nodes."
+    margin_radius_km: PositiveFloat = Field(default=100.0, example=100.0)
+    "Maximum distance to the reference nodes to consider a node as valid, in kilometers. Defaults to 100 km."
+    gradation_buffer: PositiveInt = 1
+    "Width of the transition collars between resolutions, in cells. Defaults to 1."
+
+
 NodeBuilderSchemas = Annotated[
     AnemoiDatasetNodeSchema
     | NPZnodeSchema
@@ -154,6 +175,7 @@ NodeBuilderSchemas = Annotated[
     | ReducedGaussianGridNodeSchema
     | IcosahedralandHealPixNodeSchema
     | LimitedAreaIcosahedralandHealPixNodeSchema
-    | StretchedIcosahdralNodeSchema,
+    | StretchedIcosahdralNodeSchema
+    | AdaptiveIcosahedralNodeSchema,
     Field(discriminator="target_"),
 ]

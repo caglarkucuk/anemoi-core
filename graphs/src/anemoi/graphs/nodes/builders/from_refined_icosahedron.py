@@ -15,10 +15,12 @@ from abc import abstractmethod
 import networkx as nx
 import numpy as np
 import torch
+from hydra.utils import instantiate
 from torch_geometric.data import HeteroData
 
 from anemoi.graphs.generate.masks import AreaMaskBuilder
 from anemoi.graphs.nodes.builders.base import BaseNodeBuilder
+from anemoi.utils.config import DotDict  # noqa: TC002
 
 LOGGER = logging.getLogger(__name__)
 
@@ -206,3 +208,74 @@ class StretchedTriNodes(StretchedIcosahedronNodes):
             lam_resolution=max(self.resolutions),
             area_mask_builder=self.area_mask_builder,
         )
+
+
+class AdaptiveTriNodes(LimitedAreaIcosahedralNodes):
+    """Nodes based on iterative refinements of an icosahedron with a spatially varying resolution.
+
+    Generalises StretchedTriNodes from two resolutions to a target refinement level field over
+    the sphere, so that the mesh can be made denser wherever a criterion asks for it (complex
+    orography, for instance) rather than over a whole rectangular domain.
+
+    Passing no `level_field` reproduces StretchedTriNodes exactly, which is what the regression
+    test relies on.
+
+    It depends on the trimesh Python library.
+
+    Attributes
+    ----------
+    base_resolution : int
+        Coarsest refinement level, used wherever nothing finer is requested.
+    level_field : BaseLevelField | None
+        Source of the target refinement level.
+    gradation_buffer : int
+        Width of the transition collars between resolutions, in cells.
+    """
+
+    multi_scale_edge_cls: str = "anemoi.graphs.generate.multi_scale_edges.StretchedTriNodesEdgeBuilder"
+
+    def __init__(
+        self,
+        base_resolution: int,
+        max_resolution: int,
+        name: str,
+        reference_node_name: str,
+        level_field: DotDict | None = None,
+        aoi_resolution: int | None = None,
+        mask_attr_name: str | None = None,
+        margin_radius_km: float = 100.0,
+        gradation_buffer: int = 1,
+    ) -> None:
+        super().__init__(
+            resolution=max_resolution,
+            reference_node_name=reference_node_name,
+            mask_attr_name=mask_attr_name,
+            margin_radius_km=margin_radius_km,
+            name=name,
+        )
+        assert base_resolution <= max_resolution, "The base resolution cannot exceed the maximum resolution."
+        assert (
+            aoi_resolution is None or base_resolution <= aoi_resolution <= max_resolution
+        ), "The AOI resolution must lie between the base and maximum resolutions."
+        self.base_resolution = base_resolution
+        self.aoi_resolution = aoi_resolution
+        self.level_field = instantiate(level_field) if level_field is not None else None
+        self.gradation_buffer = gradation_buffer
+        self.node_levels: np.ndarray | None = None
+        self.hidden_attributes = self.hidden_attributes | {"node_levels"}
+
+    def create_nodes(self) -> tuple[nx.Graph, np.ndarray, list[int]]:
+        from anemoi.graphs.generate.tri_icosahedron import create_adaptive_tri_nodes
+
+        nx_graph, coords_rad, node_ordering, node_levels = create_adaptive_tri_nodes(
+            base_resolution=self.base_resolution,
+            max_resolution=max(self.resolutions),
+            level_field=self.level_field,
+            area_mask_builder=self.area_mask_builder,
+            aoi_resolution=self.aoi_resolution,
+            gradation_buffer=self.gradation_buffer,
+        )
+        # Carried out of band because IcosahedralNodes.get_coordinates expects a 3-tuple, the
+        # same way nx_graph and node_ordering are.
+        self.node_levels = torch.from_numpy(node_levels.astype(np.int16))
+        return nx_graph, coords_rad, node_ordering

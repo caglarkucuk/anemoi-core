@@ -10,6 +10,7 @@
 
 import logging
 from typing import Literal
+from typing import Optional
 
 from pydantic import Field
 
@@ -73,6 +74,20 @@ class NonmissingAnemoiDatasetVariableSchema(BaseModel):
     "The anemoi-datasets variable to use."
 
 
+class MeshLevelSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.attributes.MeshLevel"] = Field(..., alias="_target_")
+    "Refinement level of each node of an adaptive icosahedral mesh, from anemoi.graphs.nodes.attributes."
+    norm: Optional[ImplementedNormalisationSchema] = None
+    "Normalisation of the levels. Defaults to none, keeping the raw level index."
+
+
+class MeshLevelMaskSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.attributes.MeshLevelMask"] = Field(..., alias="_target_")
+    "Mask selecting the nodes of an adaptive mesh at given refinement levels, from anemoi.graphs.nodes.attributes."
+    level: int | list[int] = Field(examples=[10, [10, 11]])
+    "Refinement level(s) to select."
+
+
 SingleAttributeSchema = (
     PlanarAreaWeightSchema
     | MaskedPlanarAreaWeightsSchema
@@ -80,6 +95,8 @@ SingleAttributeSchema = (
     | CutOutMaskSchema
     | GridsMaskSchema
     | NonmissingAnemoiDatasetVariableSchema
+    | MeshLevelSchema
+    | MeshLevelMaskSchema
 )
 
 

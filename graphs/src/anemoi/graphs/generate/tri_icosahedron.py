@@ -14,10 +14,13 @@ from collections.abc import Iterable
 import networkx as nx
 import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 from sklearn.neighbors import BallTree
 
+from anemoi.graphs import EARTH_RADIUS
 from anemoi.graphs.generate.masks import AreaMaskBuilder
 from anemoi.graphs.generate.transforms import cartesian_to_latlon_rad
+from anemoi.graphs.generate.transforms import latlon_rad_to_cartesian_np
 from anemoi.graphs.generate.utils import get_coordinates_ordering
 
 LOGGER = logging.getLogger(__name__)
@@ -120,6 +123,198 @@ def create_stretched_tri_nodes(
     nx_graph = create_nx_graph_from_tri_coords(coords_rad, node_ordering)
 
     return nx_graph, coords_rad, list(node_ordering)
+
+
+def get_num_vertices(resolution: int) -> int:
+    """Number of vertices of an icosphere at the given refinement level."""
+    return 10 * 4**resolution + 2
+
+
+def get_birth_levels(num_vertices: int) -> np.ndarray:
+    """Refinement level at which each vertex of an icosphere first appears.
+
+    ``trimesh.creation.icosphere`` produces strictly nested vertex arrays: the vertices of
+    the level-r icosphere are the first ``10 * 4**r + 2`` vertices of the level-(r+1) one,
+    in the same order. A vertex index therefore determines the coarsest mesh containing it,
+    without any geometry being involved.
+
+    Parameters
+    ----------
+    num_vertices : int
+        Number of vertices of the finest icosphere considered.
+
+    Returns
+    -------
+    np.ndarray of shape (num_vertices, )
+        The refinement level at which each vertex is introduced.
+    """
+    # 20 levels is far beyond anything that fits in memory, so this never truncates.
+    thresholds = np.array([get_num_vertices(r) for r in range(20)])
+    return np.searchsorted(thresholds, np.arange(num_vertices), side="right").astype(np.int16)
+
+
+def get_mean_spacing_km(resolution: int) -> float:
+    """Mean distance between neighbouring vertices of an icosphere, in kilometres."""
+    return float(np.sqrt(4 * np.pi * EARTH_RADIUS**2 / get_num_vertices(resolution)))
+
+
+def enforce_level_gradation(
+    target_levels: np.ndarray,
+    coords_rad: np.ndarray,
+    min_level: int,
+    max_level: int,
+    buffer: int = 1,
+) -> np.ndarray:
+    """Grow a collar of intermediate resolution around every refined region.
+
+    A vertex introduced at level r is the midpoint of a level-(r-1) edge, so it has exactly
+    two parents at level r-1 or coarser. If the target level drops by more than one between
+    a vertex and its parents, those parents are discarded and the vertex is left hanging off
+    the mesh with a degree of 2. Making the target level field 1-Lipschitz with respect to
+    mesh adjacency rules that out: every kept vertex is guaranteed to keep both parents.
+
+    Parameters
+    ----------
+    target_levels : np.ndarray of shape (num_vertices, )
+        Requested refinement level for each vertex.
+    coords_rad : np.ndarray of shape (num_vertices, 2)
+        Vertex coordinates, in radians.
+    min_level : int
+        Coarsest level of the mesh. Levels are never lowered below this.
+    max_level : int
+        Finest level of the mesh.
+    buffer : int, optional
+        Width of each collar, in cells of the coarser level. 1 is the minimum that guarantees
+        well-formedness; larger values soften the transition, by default 1.
+
+    Returns
+    -------
+    np.ndarray of shape (num_vertices, )
+        Target levels satisfying the gradation constraint.
+    """
+    assert buffer >= 1, "A buffer of at least 1 cell is required to keep the mesh well-formed."
+
+    levels = np.clip(target_levels, min_level, max_level).astype(np.int16)
+    vertices_xyz = latlon_rad_to_cartesian_np(coords_rad)
+
+    # Walk from the finest level down, dilating each refined region by one collar at a time.
+    for level in range(max_level, min_level, -1):
+        refined = np.where(levels >= level)[0]
+        if len(refined) == 0:
+            continue
+
+        # Chord length equivalent to `buffer` cells of the next coarser mesh.
+        radius_km = buffer * get_mean_spacing_km(level - 1)
+        chord = 2 * np.sin(radius_km / (2 * EARTH_RADIUS))
+
+        # Only vertices in the axis-aligned bounding box of the refined region, grown by the
+        # collar width, can be reached. Restricting the tree to those keeps the cost tied to
+        # the size of the refined region rather than to the resolution of the whole sphere,
+        # which matters because the finest icosphere can hold tens of millions of vertices.
+        refined_xyz = vertices_xyz[refined]
+        lower, upper = refined_xyz.min(axis=0) - chord, refined_xyz.max(axis=0) + chord
+        candidates = np.flatnonzero(np.all((vertices_xyz >= lower) & (vertices_xyz <= upper), axis=1))
+
+        neighbours = cKDTree(vertices_xyz[candidates]).query_ball_point(refined_xyz, r=chord, workers=-1)
+        collar = candidates[np.unique(np.concatenate(neighbours))] if len(neighbours) else np.array([], dtype=int)
+        levels[collar] = np.maximum(levels[collar], level - 1)
+        LOGGER.debug(
+            "Gradation at level %d: %d refined vertices grew a collar of %d vertices (%.1f km, %d candidates).",
+            level,
+            len(refined),
+            len(collar),
+            radius_km,
+            len(candidates),
+        )
+
+    return levels
+
+
+def create_adaptive_tri_nodes(
+    base_resolution: int,
+    max_resolution: int,
+    level_field=None,
+    area_mask_builder: AreaMaskBuilder | None = None,
+    aoi_resolution: int | None = None,
+    gradation_buffer: int = 1,
+) -> tuple[nx.DiGraph, np.ndarray, list[int], np.ndarray]:
+    """Creates a global mesh whose resolution varies from point to point.
+
+    Generalises :func:`create_stretched_tri_nodes` from two resolutions to a target level
+    field over the sphere. Each vertex of the level-``max_resolution`` icosphere is kept if
+    it is introduced no later than the level requested at its own location::
+
+        keep(v)  <=>  birth_level(v) <= target_level(v)
+
+    A two-valued target level field reproduces :func:`create_stretched_tri_nodes` exactly.
+
+    Parameters
+    ---------
+    base_resolution : int
+        Coarsest resolution level, applied wherever nothing finer is requested.
+    max_resolution : int
+        Finest resolution level the target level field may request.
+    level_field : BaseLevelField, optional
+        Source of additional refinement, layered on top of the AOI floor. A level field only
+        ever raises the resolution: the level actually used is the larger of the two, so a
+        field may return 0 wherever it has nothing to ask for. When None, the mesh is the
+        two-resolution stretched grid of :func:`create_stretched_tri_nodes`.
+    area_mask_builder : AreaMaskBuilder, optional
+        Builder used to generate the Area Of Interest (AOI) mask.
+    aoi_resolution : int, optional
+        Resolution floor inside the AOI, by default `max_resolution`. Lowering it leaves room
+        for a level field to refine selectively rather than covering the whole AOI.
+    gradation_buffer : int, optional
+        Width of the transition collars, in cells, by default 1.
+
+    Returns
+    -------
+    nx_graph : nx.DiGraph
+        The graph with the added nodes.
+    coords_rad : np.ndarray
+        The node coordinates (not ordered) in radians.
+    node_ordering : list[int]
+        Order of the node coordinates to be sorted by latitude and longitude.
+    node_levels : np.ndarray
+        Refinement level of each node, in the order given by `node_ordering`.
+    """
+    assert base_resolution <= max_resolution, "The base resolution cannot exceed the maximum resolution."
+
+    coords_rad = get_latlon_coords_icosphere(max_resolution)
+    node_ordering = get_coordinates_ordering(coords_rad)
+    birth_levels = get_birth_levels(len(coords_rad))
+
+    aoi_resolution = max_resolution if aoi_resolution is None else aoi_resolution
+
+    target_levels = np.full(len(coords_rad), base_resolution, dtype=np.int16)
+    if area_mask_builder is not None:
+        area_mask = area_mask_builder.get_mask(coords_rad).cpu().numpy()
+        target_levels[area_mask] = aoi_resolution
+
+    if level_field is None:
+        # A two-valued field is 1-Lipschitz only in the trivial case, and gradation here would
+        # silently change the mesh. Skip it so this path stays a drop-in for the stretched grid.
+        assert area_mask_builder is not None, "An AOI mask builder is required when no level field is given."
+    else:
+        # A level field only ever refines, so that it composes with the AOI floor.
+        target_levels = np.maximum(target_levels, level_field.get_levels(coords_rad)).astype(np.int16)
+        target_levels = enforce_level_gradation(
+            target_levels, coords_rad, base_resolution, max_resolution, gradation_buffer
+        )
+
+    keep = birth_levels <= target_levels
+    node_ordering = node_ordering[keep[node_ordering]]
+    LOGGER.info(
+        "Adaptive mesh: kept %d of %d vertices; level histogram %s",
+        len(node_ordering),
+        len(coords_rad),
+        dict(zip(*np.unique(birth_levels[node_ordering], return_counts=True))),
+    )
+
+    # Creates the graph, with the nodes sorted by latitude and longitude.
+    nx_graph = create_nx_graph_from_tri_coords(coords_rad, node_ordering)
+
+    return nx_graph, coords_rad, list(node_ordering), birth_levels[node_ordering]
 
 
 def get_latlon_coords_icosphere(resolution: int) -> np.ndarray:
