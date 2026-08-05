@@ -149,6 +149,21 @@ class TrainableParameters(PydanticBaseModel):
     "Size of the learnable hidden node tensor. Default to 8."
 
 
+class NodeAttributes(PydanticBaseModel):
+    """Graph node attributes to expose to the model as input features.
+
+    Names refer to attributes registered on the graph under `graph.nodes.<name>.attributes`.
+    They are appended to the node feature vector after the coordinates and the trainable
+    parameters, and must be normalised graph-side: raw values such as elevation in metres would
+    otherwise dominate the sin/cos coordinates, which lie in [-1, 1].
+    """
+
+    data: list[str] = Field(default_factory=list, examples=[[], ["orography"]])
+    "Graph attributes of the data nodes to pass to the model. Empty by default."
+    hidden: list[str] = Field(default_factory=list, examples=[[], ["mesh_level"]])
+    "Graph attributes of the hidden nodes to pass to the model. Empty by default."
+
+
 class ReluBoundingSchema(BaseModel):
     target_: Literal["anemoi.models.layers.bounding.ReluBounding"] = Field(..., alias="_target_")
     "Relu bounding object defined in anemoi.models.layers.bounding."
@@ -258,6 +273,8 @@ class BaseModelSchema(PydanticBaseModel):
     "Model schema."
     trainable_parameters: TrainableParameters = Field(default_factory=TrainableParameters)
     "Learnable node and edge parameters."
+    node_attributes: NodeAttributes = Field(default_factory=NodeAttributes)
+    "Graph node attributes to pass to the model as input features. Empty by default."
     bounding: list[Bounding]
     "List of bounding configuration applied in order to the specified variables."
     output_mask: OutputMaskSchemas  # !TODO CHECK!

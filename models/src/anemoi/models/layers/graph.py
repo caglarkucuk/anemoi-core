@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 from torch import nn
 from torch_geometric.data import HeteroData
+from torch_geometric.data.storage import NodeStorage
 
 
 class TrainableTensor(nn.Module):
@@ -70,25 +71,49 @@ class NamedNodesAttributes(nn.Module):
     attr_ndims: dict[str, int]
     trainable_tensors: dict[str, TrainableTensor]
 
-    def __init__(self, trainable_parameters: dict[str, int], graph_data: HeteroData) -> None:
+    def __init__(
+        self,
+        trainable_parameters: dict[str, int],
+        graph_data: HeteroData,
+        node_attributes: dict[str, list[str]] | None = None,
+    ) -> None:
         """Initialize NamedNodesAttributes."""
         super().__init__()
 
         trainable_parameters = defaultdict(int, trainable_parameters)
+        # Names of the graph node attributes to expose to the model, per group of nodes. Empty by
+        # default, which reproduces the coordinates-and-trainable-params-only behaviour exactly.
+        self.node_attribute_names = defaultdict(list, node_attributes or {})
 
         self.define_fixed_attributes(graph_data, trainable_parameters)
 
         self.trainable_tensors = nn.ModuleDict()
         for nodes_name, nodes in graph_data.node_items():
             self.register_coordinates(nodes_name, nodes.x)
+            self.register_features(nodes_name, nodes)
             self.register_tensor(nodes_name, trainable_parameters[nodes_name])
+
+    @staticmethod
+    def get_attribute_width(nodes: NodeStorage, attr_name: str) -> int:
+        """Number of feature columns a graph node attribute contributes."""
+        assert attr_name in nodes, (
+            f"Node attribute '{attr_name}' was requested but is not present on these nodes. "
+            f"Available: {sorted(k for k in nodes.keys() if not k.startswith('_'))}"
+        )
+        values = nodes[attr_name]
+        return 1 if values.ndim == 1 else values.shape[-1]
 
     def define_fixed_attributes(self, graph_data: HeteroData, trainable_parameters: dict[str, int]) -> None:
         """Define fixed attributes."""
         nodes_names = list(graph_data.node_types)
         self.num_nodes = {nodes_name: graph_data[nodes_name].num_nodes for nodes_name in nodes_names}
         self.attr_ndims = {
-            nodes_name: 2 * graph_data[nodes_name].x.shape[1] + trainable_parameters[nodes_name]
+            nodes_name: 2 * graph_data[nodes_name].x.shape[1]
+            + trainable_parameters[nodes_name]
+            + sum(
+                self.get_attribute_width(graph_data[nodes_name], attr_name)
+                for attr_name in self.node_attribute_names[nodes_name]
+            )
             for nodes_name in nodes_names
         }
 
@@ -105,6 +130,27 @@ class NamedNodesAttributes(nn.Module):
         cos_values = sin_cos_coords[:, ndim:]
         return torch.atan2(sin_values, cos_values)
 
+    def register_features(self, name: str, nodes: NodeStorage) -> None:
+        """Register the graph node attributes selected for this group of nodes.
+
+        Nothing is registered when no attribute is requested, so that the feature vector is
+        byte-for-byte what it was before this was added.
+
+        Normalisation is the graph's responsibility, via the ``norm`` argument of the node
+        attribute builders: raw values such as elevation in metres would otherwise dominate the
+        sin/cos coordinates, which lie in [-1, 1].
+        """
+        attr_names = self.node_attribute_names[name]
+        if not attr_names:
+            return
+
+        columns = []
+        for attr_name in attr_names:
+            values = nodes[attr_name].float()
+            columns.append(values.unsqueeze(-1) if values.ndim == 1 else values)
+
+        self.register_buffer(f"features_{name}", torch.cat(columns, dim=-1), persistent=True)
+
     def register_tensor(self, name: str, num_trainable_params: int) -> None:
         """Register a trainable tensor."""
         self.trainable_tensors[name] = TrainableTensor(self.num_nodes[name], num_trainable_params)
@@ -112,7 +158,19 @@ class NamedNodesAttributes(nn.Module):
     def forward(self, name: str, batch_size: int) -> Tensor:
         """Returns the node attributes to be passed trough the graph neural network.
 
-        It includes both the coordinates and the trainable parameters.
+        It includes the coordinates, the trainable parameters and any selected node attributes,
+        concatenated in that order. Appending the attributes last keeps ``[latlons, trainable]``
+        as an unchanged prefix, so migrating a checkpoint across this change is a matter of
+        padding weight columns at the end rather than reordering them.
         """
         latlons = getattr(self, f"latlons_{name}")
-        return self.trainable_tensors[name](latlons, batch_size)
+        latent = self.trainable_tensors[name](latlons, batch_size)
+
+        features = getattr(self, f"features_{name}", None)
+        if features is None:
+            return latent
+
+        return torch.cat(
+            [latent, einops.repeat(features, "e f -> (repeat e) f", repeat=batch_size)],
+            dim=-1,  # feature dimension
+        )

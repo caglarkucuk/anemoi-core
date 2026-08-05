@@ -139,6 +139,10 @@ class VariableMaskingScalerSchema(BaseModel):
     "Variables to compute the loss over."
     invert: bool = Field(examples=False)
     "Flag to invert the variable mask."
+    norm: Literal["unit-sum", "l1", "unit-mean"] | None = Field(default=None, example="unit-mean")
+    "Normalisation applied to the scaler. VariableMaskingLossScaler passes this to BaseScaler, "
+    "which accepts None, unit-sum, l1 or unit-mean; the field was missing here, so a config using "
+    "it failed validation despite being valid at runtime."
 
 
 class NaNMaskScalerSchema(BaseModel):

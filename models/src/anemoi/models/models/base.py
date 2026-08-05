@@ -79,7 +79,21 @@ class BaseGraphModel(nn.Module):
             data=self.dataset_names,
             hidden=self._graph_name_hidden,
         )
-        self.node_attributes = NamedNodesAttributes(trainable_parameters, self._build_named_node_attributes_graph())
+        # Graph node attributes to expose to the model, e.g. {hidden: [mesh_level]}. Defaults to
+        # none, which leaves the node feature vector as coordinates plus trainable parameters.
+        # Both keys have to be present before broadcasting, which raises on a missing one.
+        configured_attributes = model_config.model.get("node_attributes", None) or {}
+        requested_attributes = {key: list(value) for key, value in configured_attributes.items()}
+        requested_attributes.setdefault("data", [])
+        requested_attributes.setdefault("hidden", [])
+        node_attributes = broadcast_config_keys(
+            requested_attributes,
+            data=self.dataset_names,
+            hidden=self._graph_name_hidden,
+        )
+        self.node_attributes = NamedNodesAttributes(
+            trainable_parameters, self._build_named_node_attributes_graph(node_attributes), node_attributes
+        )
 
         self._calculate_shapes_and_indices(data_indices)
         self._assert_matching_indices(data_indices)
@@ -257,15 +271,31 @@ class BaseGraphModel(nn.Module):
                 sparse_projector_num_chunks=sparse_projector_num_chunks,
             )
 
-    def _build_named_node_attributes_graph(self) -> HeteroData:
+    def _build_named_node_attributes_graph(self, node_attributes: dict[str, list[str]] | None = None) -> HeteroData:
+        """Reduce the graph to what NamedNodesAttributes needs.
+
+        Only the coordinates are carried over by default. Any node attribute named in
+        `node_attributes` is copied across as well; everything else on the graph is dropped,
+        since it exists for graph construction or loss scaling rather than as a model input.
+        """
+        node_attributes = node_attributes or {}
         node_attributes_graph = HeteroData()
+
+        def copy_nodes(nodes_name: str) -> None:
+            node_attributes_graph[nodes_name].x = self._graph_data[nodes_name].x
+            node_attributes_graph[nodes_name].num_nodes = self._graph_data[nodes_name].num_nodes
+            for attr_name in node_attributes.get(nodes_name, []):
+                assert attr_name in self._graph_data[nodes_name], (
+                    f"Node attribute '{attr_name}' was requested for '{nodes_name}' but is not on the graph. "
+                    f"Available: {sorted(k for k in self._graph_data[nodes_name].keys() if not k.startswith('_'))}"
+                )
+                node_attributes_graph[nodes_name][attr_name] = self._graph_data[nodes_name][attr_name]
+
         for dataset_name in self.dataset_names:
-            node_attributes_graph[dataset_name].x = self._graph_data[dataset_name].x
-            node_attributes_graph[dataset_name].num_nodes = self._graph_data[dataset_name].num_nodes
+            copy_nodes(dataset_name)
 
         for hidden_name in self._as_hidden_node_names(self._graph_name_hidden):
-            node_attributes_graph[hidden_name].x = self._graph_data[hidden_name].x
-            node_attributes_graph[hidden_name].num_nodes = self._graph_data[hidden_name].num_nodes
+            copy_nodes(hidden_name)
 
         return node_attributes_graph
 
